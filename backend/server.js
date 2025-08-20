@@ -12,9 +12,14 @@ const io = socketIo(server, {
 	cors: {
 		origin: process.env.CORS_ORIGIN || "http://localhost:5173",
 		methods: ["GET", "POST"]
-	}
+	},
+	compression: true,
+	maxHttpBufferSize: 1e6, // 1MB limit
+	pingTimeout: 60000,
+	pingInterval: 25000
 });
 
+// Middleware
 app.use(helmet());
 app.use(cors({
 	origin: process.env.CORS_ORIGIN || "http://localhost:5173",
@@ -23,298 +28,605 @@ app.use(cors({
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
+// Routes
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/quiz', require('./routes/quiz'));
 app.use('/api/game', require('./routes/game'));
 
+// Health check
 app.get('/health', (req, res) => {
 	res.json({ 
 		status: 'OK', 
 		timestamp: new Date().toISOString(),
-		uptime: process.uptime()
+		uptime: process.uptime(),
+		activeSessions: gameSessions.size,
+		activeConnections: io.engine.clientsCount
 	});
 });
 
-// sessionId -> { players: Map<playerId, {socketId, nickname, joinedAt}>, host: socketId, status }
+// Game session management
 const gameSessions = new Map();
-
 const { pool } = require('./db');
 
-function mapQuestionRow(row, choices) {
-	return {
-		id: row.id,
-		content: row.content,
-		image_url: row.image_url,
-		time_limit_s: row.time_limit_s,
-		points: row.points,
-		order_index: row.order_index,
-		choices: choices
-	};
-}
+// Utility functions
+const GameUtils = {
+	// Map database row to question object
+	mapQuestionRow(row, choices) {
+		return {
+			id: row.id,
+			content: row.content,
+			image_url: row.image_url,
+			time_limit_s: row.time_limit_s,
+			points: row.points,
+			order_index: row.order_index,
+			choices: choices.map(c => ({
+				id: c.id,
+				content: c.content,
+				is_correct: c.is_correct
+			}))
+		};
+	},
 
-async function fetchQuestionWithChoicesByOrder(quizId, orderIndex) {
-	const [qRows] = await pool.execute('SELECT * FROM questions WHERE quiz_id = ? AND order_index = ? LIMIT 1', [quizId, orderIndex]);
-	if (qRows.length === 0) return null;
-	const q = qRows[0];
-	const [cRows] = await pool.execute('SELECT id, content, is_correct FROM choices WHERE question_id = ? ORDER BY order_index', [q.id]);
-	return mapQuestionRow(q, cRows);
-}
-
-async function emitQuestion(io, roomOrSocketId, quizId, orderIndex, toRoom = true) {
-	const question = await fetchQuestionWithChoicesByOrder(quizId, orderIndex);
-	if (!question) return false;
-	const [[{ cnt }]] = await pool.execute('SELECT COUNT(*) as cnt FROM questions WHERE quiz_id = ?', [quizId]);
-	const target = toRoom ? io.to(roomOrSocketId) : io.to(roomOrSocketId);
-	target.emit('question_displayed', { question, totalQuestions: cnt, orderIndex });
-	return true;
-}
-
-io.on('connection', (socket) => {
-	console.log('User connected:', socket.id);
-
-	// Join session (host or player)
-	socket.on('join_session', async (data) => {
-		const { sessionId, playerId, nickname, isHost } = data || {};
-		if (!sessionId) {
-			socket.emit('app_error', { message: 'Thiếu sessionId' });
-			return;
+	// Fetch question with choices by order index
+	async fetchQuestionWithChoicesByOrder(quizId, orderIndex) {
+		try {
+			const [qRows] = await pool.execute(
+				'SELECT * FROM questions WHERE quiz_id = ? AND order_index = ? LIMIT 1', 
+				[quizId, orderIndex]
+			);
+			if (qRows.length === 0) return null;
+			
+			const q = qRows[0];
+			const [cRows] = await pool.execute(
+				'SELECT id, content, is_correct FROM choices WHERE question_id = ? ORDER BY order_index', 
+				[q.id]
+			);
+			
+			return this.mapQuestionRow(q, cRows);
+		} catch (error) {
+			console.error('Error fetching question:', error);
+			return null;
 		}
+	},
 
-		if (!gameSessions.has(sessionId)) {
-			gameSessions.set(sessionId, { players: new Map(), host: null, status: 'waiting' });
-		}
-		const session = gameSessions.get(sessionId);
-
-		// Join socket room
-		socket.join(sessionId);
-		socket.sessionId = sessionId;
-
-		if (isHost) {
-			// Mark this socket as host
-			session.host = socket.id;
-			socket.isHost = true;
-			io.to(sessionId).emit('host_joined', {});
-			console.log(`Host joined session ${sessionId}`);
-		} else {
-			if (!playerId || !nickname) {
-				socket.emit('app_error', { message: 'Thiếu playerId hoặc nickname' });
-				return;
+	// Emit question to room or specific socket
+	async emitQuestion(io, target, quizId, orderIndex, toRoom = true) {
+		try {
+			const question = await this.fetchQuestionWithChoicesByOrder(quizId, orderIndex);
+			if (!question) return false;
+			
+			const [[{ cnt }]] = await pool.execute(
+				'SELECT COUNT(*) as cnt FROM questions WHERE quiz_id = ?', 
+				[quizId]
+			);
+			
+			const payload = { 
+				question, 
+				totalQuestions: cnt, 
+				orderIndex,
+				timestamp: Date.now()
+			};
+			
+			if (toRoom) {
+				io.to(target).emit('question_displayed', payload);
+			} else {
+				io.to(target).emit('question_displayed', payload);
 			}
-			// Track player
-			session.players.set(playerId, { socketId: socket.id, nickname, joinedAt: new Date() });
-			socket.playerId = playerId;
-			socket.nickname = nickname;
-
-			// Notify others and broadcast latest list
-			socket.to(sessionId).emit('player_joined', { playerId, nickname, joinedAt: new Date() });
-			const playersListAll = Array.from(session.players.entries()).map(([id, p]) => ({ playerId: id, nickname: p.nickname, joinedAt: p.joinedAt }));
-			io.to(sessionId).emit('session_players', playersListAll);
-
-			// Nếu host đang online trong phòng, gửi riêng đảm bảo host nhận được
-			if (session.host) {
-				io.to(session.host).emit('session_players', playersListAll);
-			}
+			
+			return true;
+		} catch (error) {
+			console.error('Error emitting question:', error);
+			return false;
 		}
+	},
 
-		// Send current players list to this socket (redundant but safe)
-		const playersList = Array.from(session.players.entries()).map(([id, p]) => ({
+	// Get players list for session
+	getPlayersList(session) {
+		return Array.from(session.players.entries()).map(([id, p]) => ({
 			playerId: id,
 			nickname: p.nickname,
 			joinedAt: p.joinedAt
 		}));
-		socket.emit('session_players', playersList);
+	},
 
-		// If a question is already active for this session, send it to the newly joined socket
-		if (session.currentOrder && !session.questionClosed) {
-			const [[row]] = await pool.execute('SELECT quiz_id FROM quiz_sessions WHERE id = ?', [sessionId]);
-			if (row) {
-				await emitQuestion(io, socket.id, row.quiz_id, session.currentOrder, false);
+	// Broadcast players list to room
+	broadcastPlayersList(io, sessionId, session) {
+		const playersList = this.getPlayersList(session);
+		io.to(sessionId).emit('session_players', playersList);
+		
+		// Ensure host gets the update
+		if (session.host) {
+			io.to(session.host).emit('session_players', playersList);
+		}
+	},
+
+	// Clean up inactive sessions
+	cleanupInactiveSessions() {
+		const now = Date.now();
+		for (const [sessionId, session] of gameSessions.entries()) {
+			// Remove players inactive for more than 5 minutes
+			for (const [playerId, player] of session.players.entries()) {
+				if (now - player.joinedAt.getTime() > 300000) { // 5 minutes
+					session.players.delete(playerId);
+				}
 			}
+			
+			// Remove empty sessions
+			if (session.players.size === 0 && !session.host) {
+				gameSessions.delete(sessionId);
+			}
+		}
+	}
+};
+
+// Socket connection handler
+io.on('connection', (socket) => {
+	console.log('User connected:', socket.id);
+	
+	// Rate limiting for socket events
+	const rateLimit = new Map();
+	const checkRateLimit = (eventName, limit = 100) => {
+		const now = Date.now();
+		const key = `${socket.id}:${eventName}`;
+		const lastEmit = rateLimit.get(key) || 0;
+		
+		if (now - lastEmit < limit) {
+			return false;
+		}
+		rateLimit.set(key, now);
+		return true;
+	};
+
+	// Join session (host or player)
+	socket.on('join_session', async (data) => {
+		try {
+			const { sessionId, playerId, nickname, isHost } = data || {};
+			if (!sessionId) {
+				socket.emit('app_error', { message: 'Thiếu sessionId' });
+				return;
+			}
+
+			// Initialize session if not exists
+			if (!gameSessions.has(sessionId)) {
+				gameSessions.set(sessionId, { 
+					players: new Map(), 
+					host: null, 
+					status: 'waiting',
+					createdAt: Date.now()
+				});
+			}
+			const session = gameSessions.get(sessionId);
+
+			// Join socket room
+			socket.join(sessionId);
+			socket.sessionId = sessionId;
+
+			if (isHost) {
+				// Mark this socket as host
+				session.host = socket.id;
+				socket.isHost = true;
+				io.to(sessionId).emit('host_joined', {});
+				console.log(`Host joined session ${sessionId}`);
+			} else {
+				if (!playerId || !nickname) {
+					socket.emit('app_error', { message: 'Thiếu playerId hoặc nickname' });
+					return;
+				}
+				
+				// Track player
+				session.players.set(playerId, { 
+					socketId: socket.id, 
+					nickname, 
+					joinedAt: new Date(),
+					lastActivity: Date.now()
+				});
+				socket.playerId = playerId;
+				socket.nickname = nickname;
+
+				// Notify others and broadcast latest list
+				socket.to(sessionId).emit('player_joined', { 
+					playerId, 
+					nickname, 
+					joinedAt: new Date() 
+				});
+				GameUtils.broadcastPlayersList(io, sessionId, session);
+			}
+
+			// Send current players list to this socket
+			const playersList = GameUtils.getPlayersList(session);
+			socket.emit('session_players', playersList);
+
+			// If a question is already active, send it to the newly joined socket
+			if (session.currentOrder && !session.questionClosed) {
+				const [[row]] = await pool.execute(
+					'SELECT quiz_id FROM quiz_sessions WHERE id = ?', 
+					[sessionId]
+				);
+				if (row) {
+					await GameUtils.emitQuestion(io, socket.id, row.quiz_id, session.currentOrder, false);
+				}
+			}
+		} catch (error) {
+			console.error('Error in join_session:', error);
+			socket.emit('app_error', { message: 'Lỗi khi tham gia session' });
 		}
 	});
 
-	// Client asks for the current active question explicitly (fallback)
+	// Request current question (fallback)
 	socket.on('request_current', async ({ sessionId }) => {
-		const session = gameSessions.get(sessionId);
-		if (!session || !session.currentOrder || session.questionClosed) return;
-		const [[row]] = await pool.execute('SELECT quiz_id FROM quiz_sessions WHERE id = ?', [sessionId]);
-		if (!row) return;
-		await emitQuestion(io, socket.id, row.quiz_id, session.currentOrder, false);
+		if (!checkRateLimit('request_current', 1000)) return; // 1 request per second
+		
+		try {
+			const session = gameSessions.get(sessionId);
+			if (!session || !session.currentOrder || session.questionClosed) return;
+			
+			const [[row]] = await pool.execute(
+				'SELECT quiz_id FROM quiz_sessions WHERE id = ?', 
+				[sessionId]
+			);
+			if (!row) return;
+			
+			await GameUtils.emitQuestion(io, socket.id, row.quiz_id, session.currentOrder, false);
+		} catch (error) {
+			console.error('Error in request_current:', error);
+		}
 	});
 
-	// Client asks for progress (how many questions and current order)
+	// Request game progress
 	socket.on('request_progress', async ({ sessionId }) => {
-		const session = gameSessions.get(sessionId);
-		if (!session) return;
-		const [[row]] = await pool.execute('SELECT quiz_id FROM quiz_sessions WHERE id = ?', [sessionId]);
-		if (!row) return;
-		const [[{ cnt }]] = await pool.execute('SELECT COUNT(*) as cnt FROM questions WHERE quiz_id = ?', [row.quiz_id]);
-		io.to(socket.id).emit('question_progress', { currentOrder: session.currentOrder || 0, totalQuestions: cnt, questionClosed: !!session.questionClosed });
+		if (!checkRateLimit('request_progress', 1000)) return;
+		
+		try {
+			const session = gameSessions.get(sessionId);
+			if (!session) return;
+			
+			const [[row]] = await pool.execute(
+				'SELECT quiz_id FROM quiz_sessions WHERE id = ?', 
+				[sessionId]
+			);
+			if (!row) return;
+			
+			const [[{ cnt }]] = await pool.execute(
+				'SELECT COUNT(*) as cnt FROM questions WHERE quiz_id = ?', 
+				[row.quiz_id]
+			);
+			
+			io.to(socket.id).emit('question_progress', { 
+				currentOrder: session.currentOrder || 0, 
+				totalQuestions: cnt, 
+				questionClosed: !!session.questionClosed 
+			});
+		} catch (error) {
+			console.error('Error in request_progress:', error);
+		}
 	});
 
 	// Start game (host only)
 	socket.on('start_game', async ({ sessionId }) => {
-		const session = gameSessions.get(sessionId);
-		if (!session || session.host !== socket.id) return;
+		try {
+			const session = gameSessions.get(sessionId);
+			if (!session || session.host !== socket.id) return;
 
-		await pool.execute('UPDATE quiz_sessions SET status = "in_progress", started_at = NOW() WHERE id = ?', [sessionId]);
-		const [[row]] = await pool.execute('SELECT quiz_id FROM quiz_sessions WHERE id = ?', [sessionId]);
-		if (!row) return;
-		session.currentOrder = 1;
-		session.answerSet = new Set();
-		session.questionClosed = false;
+			// Update database
+			await pool.execute(
+				'UPDATE quiz_sessions SET status = "in_progress", started_at = NOW() WHERE id = ?', 
+				[sessionId]
+			);
+			
+			const [[row]] = await pool.execute(
+				'SELECT quiz_id FROM quiz_sessions WHERE id = ?', 
+				[sessionId]
+			);
+			if (!row) return;
+			
+			// Initialize session state
+			session.currentOrder = 1;
+			session.answerSet = new Set();
+			session.questionClosed = false;
+			session.status = 'in_progress';
 
-		// First notify clients to navigate
-		io.to(sessionId).emit('game_started', { sessionId });
-		// Then emit the question shortly after to ensure listeners are ready
-		setTimeout(async () => {
-			await emitQuestion(io, sessionId, row.quiz_id, session.currentOrder, true);
-		}, 250);
+			// Notify clients to navigate first
+			io.to(sessionId).emit('game_started', { sessionId });
+			
+			// Emit question after short delay to ensure listeners are ready
+			setTimeout(async () => {
+				await GameUtils.emitQuestion(io, sessionId, row.quiz_id, session.currentOrder, true);
+			}, 250);
+		} catch (error) {
+			console.error('Error in start_game:', error);
+			socket.emit('app_error', { message: 'Lỗi khi bắt đầu game' });
+		}
 	});
 
 	// Next question (host only)
 	socket.on('next_question', async ({ sessionId }) => {
-		const session = gameSessions.get(sessionId);
-		if (!session || session.host !== socket.id) return;
-		const [[row]] = await pool.execute('SELECT quiz_id FROM quiz_sessions WHERE id = ?', [sessionId]);
-		if (!row) return;
-		session.currentOrder = (session.currentOrder || 1) + 1;
-		session.answerSet = new Set();
-		session.questionClosed = false;
-		const ok = await emitQuestion(io, sessionId, row.quiz_id, session.currentOrder, true);
-		if (!ok) {
-			// No more questions: end only now
-			io.to(sessionId).emit('game_ended', { sessionId });
-			await pool.execute('UPDATE quiz_sessions SET status = "ended", ended_at = NOW() WHERE id = ?', [sessionId]);
+		try {
+			const session = gameSessions.get(sessionId);
+			if (!session || session.host !== socket.id) return;
+			
+			const [[row]] = await pool.execute(
+				'SELECT quiz_id FROM quiz_sessions WHERE id = ?', 
+				[sessionId]
+			);
+			if (!row) return;
+			
+			// Move to next question
+			session.currentOrder = (session.currentOrder || 1) + 1;
+			session.answerSet = new Set();
+			session.questionClosed = false;
+			
+			const ok = await GameUtils.emitQuestion(io, sessionId, row.quiz_id, session.currentOrder, true);
+			if (!ok) {
+				// No more questions: end game
+				io.to(sessionId).emit('game_ended', { sessionId });
+				await pool.execute(
+					'UPDATE quiz_sessions SET status = "ended", ended_at = NOW() WHERE id = ?', 
+					[sessionId]
+				);
+				session.status = 'ended';
+			}
+		} catch (error) {
+			console.error('Error in next_question:', error);
+			socket.emit('app_error', { message: 'Lỗi khi chuyển câu hỏi' });
 		}
 	});
 
 	// Submit answer
 	socket.on('submit_answer', async (data) => {
-		const { sessionId, questionId, choiceId, timeMs } = data;
-		const session = gameSessions.get(sessionId);
+		if (!checkRateLimit('submit_answer', 500)) return; // 2 answers per second max
 		
-		if (session) {
-			// record that this player has answered
-			if (!session.answerSet) session.answerSet = new Set();
-			session.answerSet.add(socket.playerId);
-			// Notify other players about the answer
-			socket.to(sessionId).emit('player_answered', {
-				playerId: socket.playerId,
-				questionId,
-				choiceId,
-				timeMs
-			});
-			// Auto close if all current players answered and not closed yet
-			if (!session.questionClosed && session.players && session.answerSet.size >= session.players.size) {
-				session.questionClosed = true;
-				io.to(sessionId).emit('question_closed', { sessionId });
-				const [[row]] = await pool.execute('SELECT quiz_id FROM quiz_sessions WHERE id = ?', [sessionId]);
-				if (row) {
-					const [[{ cnt }]] = await pool.execute('SELECT COUNT(*) as cnt FROM questions WHERE quiz_id = ?', [row.quiz_id]);
-					io.to(sessionId).emit('question_progress', { currentOrder: session.currentOrder || 0, totalQuestions: cnt, questionClosed: true });
+		try {
+			const { sessionId, questionId, choiceId, timeMs } = data;
+			const session = gameSessions.get(sessionId);
+			
+			if (session && socket.playerId) {
+				// Record that this player has answered
+				if (!session.answerSet) session.answerSet = new Set();
+				session.answerSet.add(socket.playerId);
+				
+				// Update player's last activity
+				const player = session.players.get(socket.playerId);
+				if (player) {
+					player.lastActivity = Date.now();
+				}
+				
+				// Notify other players about the answer
+				socket.to(sessionId).emit('player_answered', {
+					playerId: socket.playerId,
+					questionId,
+					choiceId,
+					timeMs
+				});
+				
+				// Auto close if all current players answered and not closed yet
+				if (!session.questionClosed && session.players && session.answerSet.size >= session.players.size) {
+					session.questionClosed = true;
+					io.to(sessionId).emit('question_closed', { sessionId });
+					
+					// Send progress update
+					const [[row]] = await pool.execute(
+						'SELECT quiz_id FROM quiz_sessions WHERE id = ?', 
+						[sessionId]
+					);
+					if (row) {
+						const [[{ cnt }]] = await pool.execute(
+							'SELECT COUNT(*) as cnt FROM questions WHERE quiz_id = ?', 
+							[row.quiz_id]
+						);
+						io.to(sessionId).emit('question_progress', { 
+							currentOrder: session.currentOrder || 0, 
+							totalQuestions: cnt, 
+							questionClosed: true 
+						});
+					}
 				}
 			}
+		} catch (error) {
+			console.error('Error in submit_answer:', error);
 		}
 	});
 
 	// Close current question (host only)
 	socket.on('close_question', async ({ sessionId }) => {
-		const session = gameSessions.get(sessionId);
-		if (!session || session.host !== socket.id) return;
-		if (session.questionClosed) return;
-		session.questionClosed = true;
-		io.to(sessionId).emit('question_closed', { sessionId });
-		const [[row]] = await pool.execute('SELECT quiz_id FROM quiz_sessions WHERE id = ?', [sessionId]);
-		if (row) {
-			const [[{ cnt }]] = await pool.execute('SELECT COUNT(*) as cnt FROM questions WHERE quiz_id = ?', [row.quiz_id]);
-			io.to(sessionId).emit('question_progress', { currentOrder: session.currentOrder || 0, totalQuestions: cnt, questionClosed: true });
-		}
-	});
-
-	// Host kicks a player
-	socket.on('kick_player', ({ sessionId, playerId }) => {
-		const session = gameSessions.get(sessionId);
-		if (!session || session.host !== socket.id) return;
-		const player = session.players.get(playerId);
-		if (!player) return;
-		io.to(player.socketId).emit('player_kicked', { message: 'Bạn đã bị kick khỏi game' });
-		session.players.delete(playerId);
-		io.to(sessionId).emit('player_left', { playerId, nickname: player.nickname });
-		const playersList = Array.from(session.players.entries()).map(([id, p]) => ({ playerId: id, nickname: p.nickname, joinedAt: p.joinedAt }));
-		io.to(sessionId).emit('session_players', playersList);
-	});
-
-	// Player leaves session
-	socket.on('leave_session', ({ sessionId, playerId }) => {
-		const session = gameSessions.get(sessionId);
-		if (!session) return;
-		const player = session.players.get(playerId);
-		if (player) {
-			session.players.delete(playerId);
-			socket.leave(sessionId);
-			io.to(sessionId).emit('player_left', { playerId, nickname: player.nickname });
-			const playersList = Array.from(session.players.entries()).map(([id, p]) => ({ playerId: id, nickname: p.nickname, joinedAt: p.joinedAt }));
-			io.to(sessionId).emit('session_players', playersList);
-			if (session.players.size === 0) gameSessions.delete(sessionId);
-		}
-	});
-
-	socket.on('disconnect', () => {
-		const { sessionId } = socket;
-		if (!sessionId) return;
-		const session = gameSessions.get(sessionId);
-		if (!session) return;
-
-		// If host disconnects, just clear host flag
-		if (socket.isHost && session.host === socket.id) {
-			session.host = null;
-			return;
-		}
-
-		// Remove player by socketId
-		for (const [id, p] of session.players.entries()) {
-			if (p.socketId === socket.id) {
-				session.players.delete(id);
-				io.to(sessionId).emit('player_left', { playerId: id, nickname: p.nickname });
-				const playersList = Array.from(session.players.entries()).map(([pid, pl]) => ({ playerId: pid, nickname: pl.nickname, joinedAt: pl.joinedAt }));
-				io.to(sessionId).emit('session_players', playersList);
-				break;
+		try {
+			const session = gameSessions.get(sessionId);
+			if (!session || session.host !== socket.id || session.questionClosed) return;
+			
+			session.questionClosed = true;
+			io.to(sessionId).emit('question_closed', { sessionId });
+			
+			// Send progress update
+			const [[row]] = await pool.execute(
+				'SELECT quiz_id FROM quiz_sessions WHERE id = ?', 
+				[sessionId]
+			);
+			if (row) {
+				const [[{ cnt }]] = await pool.execute(
+					'SELECT COUNT(*) as cnt FROM questions WHERE quiz_id = ?', 
+					[row.quiz_id]
+				);
+				io.to(sessionId).emit('question_progress', { 
+					currentOrder: session.currentOrder || 0, 
+					totalQuestions: cnt, 
+					questionClosed: true 
+				});
 			}
+		} catch (error) {
+			console.error('Error in close_question:', error);
 		}
-		if (session.players.size === 0 && !session.host) gameSessions.delete(sessionId);
+	});
+
+	// Kick player (host only)
+	socket.on('kick_player', ({ sessionId, playerId }) => {
+		try {
+			const session = gameSessions.get(sessionId);
+			if (!session || session.host !== socket.id) return;
+			
+			const player = session.players.get(playerId);
+			if (!player) return;
+			
+			io.to(player.socketId).emit('player_kicked', { 
+				message: 'Bạn đã bị kick khỏi game' 
+			});
+			session.players.delete(playerId);
+			
+			io.to(sessionId).emit('player_left', { 
+				playerId, 
+				nickname: player.nickname 
+			});
+			
+			GameUtils.broadcastPlayersList(io, sessionId, session);
+		} catch (error) {
+			console.error('Error in kick_player:', error);
+		}
+	});
+
+	// Leave session
+	socket.on('leave_session', ({ sessionId, playerId }) => {
+		try {
+			const session = gameSessions.get(sessionId);
+			if (!session) return;
+			
+			const player = session.players.get(playerId);
+			if (player) {
+				session.players.delete(playerId);
+				socket.leave(sessionId);
+				
+				io.to(sessionId).emit('player_left', { 
+					playerId, 
+					nickname: player.nickname 
+				});
+				
+				GameUtils.broadcastPlayersList(io, sessionId, session);
+				
+				// Clean up empty sessions
+				if (session.players.size === 0 && !session.host) {
+					gameSessions.delete(sessionId);
+				}
+			}
+		} catch (error) {
+			console.error('Error in leave_session:', error);
+		}
+	});
+
+	// Disconnect handler
+	socket.on('disconnect', () => {
+		try {
+			const { sessionId } = socket;
+			if (!sessionId) return;
+			
+			const session = gameSessions.get(sessionId);
+			if (!session) return;
+
+			// If host disconnects, clear host flag
+			if (socket.isHost && session.host === socket.id) {
+				session.host = null;
+				console.log(`Host disconnected from session ${sessionId}`);
+				return;
+			}
+
+			// Remove player by socketId
+			for (const [id, p] of session.players.entries()) {
+				if (p.socketId === socket.id) {
+					session.players.delete(id);
+					io.to(sessionId).emit('player_left', { 
+						playerId: id, 
+						nickname: p.nickname 
+					});
+					
+					const playersList = GameUtils.getPlayersList(session);
+					io.to(sessionId).emit('session_players', playersList);
+					break;
+				}
+			}
+			
+			// Clean up empty sessions
+			if (session.players.size === 0 && !session.host) {
+				gameSessions.delete(sessionId);
+			}
+			
+			console.log(`User disconnected: ${socket.id}`);
+		} catch (error) {
+			console.error('Error in disconnect:', error);
+		}
 	});
 });
 
+// Cleanup inactive sessions every 5 minutes
+setInterval(() => {
+	GameUtils.cleanupInactiveSessions();
+}, 300000);
+
+// Error handling middleware
 app.use((err, req, res, next) => {
 	console.error('Error:', err);
-	res.status(500).json({ success: false, message: 'Lỗi server nội bộ' });
+	res.status(500).json({ 
+		success: false, 
+		message: 'Lỗi server nội bộ',
+		timestamp: new Date().toISOString()
+	});
 });
 
+// 404 handler
 app.use('*', (req, res) => {
-	res.status(404).json({ success: false, message: 'API endpoint không tồn tại' });
+	res.status(404).json({ 
+		success: false, 
+		message: 'API endpoint không tồn tại',
+		path: req.originalUrl,
+		timestamp: new Date().toISOString()
+	});
 });
 
+// Start server
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
 	console.log(`🚀 Server đang chạy tại port ${PORT}`);
 	console.log(`📱 Frontend: ${process.env.CORS_ORIGIN || 'http://localhost:5173'}`);
 	console.log(`🗄️  Database: ${process.env.DB_HOST}:${process.env.DB_PORT}/${process.env.DB_NAME}`);
 	console.log(`🔧 Environment: ${process.env.NODE_ENV || 'development'}`);
+	console.log(`⚡ Socket.io compression: enabled`);
+	console.log(`🔄 Cleanup interval: 5 minutes`);
 });
 
-process.on('SIGTERM', () => {
-	console.log('SIGTERM received, shutting down gracefully');
+// Graceful shutdown
+const gracefulShutdown = (signal) => {
+	console.log(`${signal} received, shutting down gracefully`);
 	server.close(() => {
-		console.log('Process terminated');
-		process.exit(0);
+		console.log('HTTP server closed');
+		
+		// Close database connections
+		pool.end((err) => {
+			if (err) {
+				console.error('Error closing database pool:', err);
+			} else {
+				console.log('Database connections closed');
+			}
+			
+			// Close socket.io
+			io.close(() => {
+				console.log('Socket.io server closed');
+				process.exit(0);
+			});
+		});
 	});
+	
+	// Force exit after 10 seconds
+	setTimeout(() => {
+		console.error('Could not close connections in time, forcefully shutting down');
+		process.exit(1);
+	}, 10000);
+};
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (err) => {
+	console.error('Uncaught Exception:', err);
+	gracefulShutdown('UNCAUGHT_EXCEPTION');
 });
 
-process.on('SIGINT', () => {
-	console.log('SIGINT received, shutting down gracefully');
-	server.close(() => {
-		console.log('Process terminated');
-		process.exit(0);
-	});
+process.on('unhandledRejection', (reason, promise) => {
+	console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+	gracefulShutdown('UNHANDLED_REJECTION');
 });
