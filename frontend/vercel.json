@@ -2,6 +2,8 @@
     "builds": [
       { "src": "package.json", "use": "@vercel/static-build" }
     ],
-    "outputDirectory": "dist"
+    "outputDirectory": "dist",
+    "rewrites": [
+        { "source": "/(.*)", "destination": "/" }
+      ]
   }
-  
