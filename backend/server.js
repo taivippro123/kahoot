@@ -44,9 +44,12 @@ app.get('/health', (req, res) => {
 	});
 });
 
-// Game session management
+// Game session management với cache state tối ưu
 const gameSessions = new Map();
 const { pool } = require('./db');
+
+// Game state cache để tối ưu performance
+const gameStateCache = new Map();
 
 // Utility functions
 const GameUtils = {
@@ -154,7 +157,96 @@ const GameUtils = {
 			// Remove empty sessions
 			if (session.players.size === 0 && !session.host) {
 				gameSessions.delete(sessionId);
+				gameStateCache.delete(sessionId); // Clean up cache
 			}
+		}
+	},
+
+	// Tối ưu: Lưu answer vào cache thay vì DB ngay lập tức
+	saveAnswerToCache(sessionId, playerId, questionId, choiceId, timeMs) {
+		if (!gameStateCache.has(sessionId)) {
+			gameStateCache.set(sessionId, {
+				answers: [],
+				scores: new Map(),
+				lastUpdate: Date.now()
+			});
+		}
+		
+		const state = gameStateCache.get(sessionId);
+		state.answers.push({
+			playerId,
+			questionId,
+			choiceId,
+			timeMs,
+			timestamp: Date.now()
+		});
+		state.lastUpdate = Date.now();
+	},
+
+	// Tối ưu: Ghi DB async không block socket
+	async saveAnswerToDB(answer) {
+		setImmediate(async () => {
+			try {
+				await pool.execute(
+					'INSERT INTO player_answers (session_id, player_id, question_id, choice_id, time_ms, is_correct, score_earned) VALUES (?, ?, ?, ?, ?, ?, ?)',
+					[answer.sessionId, answer.playerId, answer.questionId, answer.choiceId, answer.timeMs, answer.isCorrect ? 1 : 0, answer.score]
+				);
+			} catch (error) {
+				console.error('Error saving answer to DB:', error);
+			}
+		});
+	},
+
+	// Tối ưu: Batch save answers khi kết thúc round
+	async batchSaveAnswers(sessionId) {
+		try {
+			const state = gameStateCache.get(sessionId);
+			if (!state || state.answers.length === 0) return;
+
+			// Lấy thông tin câu hỏi và tính điểm
+			const answersToSave = [];
+			for (const answer of state.answers) {
+				const [[questionRow]] = await pool.execute(
+					'SELECT q.points, c.is_correct FROM questions q JOIN choices c ON q.id = c.question_id WHERE q.id = ? AND c.id = ?',
+					[answer.questionId, answer.choiceId]
+				);
+				
+				if (questionRow) {
+					const isCorrect = questionRow.is_correct === 1;
+					let score = 0;
+					if (isCorrect) {
+						const maxTime = 20000; // 20 seconds default
+						const timeBonus = Math.max(0, (maxTime - answer.timeMs) / maxTime);
+						score = Math.round((questionRow.points || 1000) * (0.5 + 0.5 * timeBonus));
+					}
+					
+					answersToSave.push({
+						...answer,
+						isCorrect,
+						score
+					});
+				}
+			}
+
+			// Batch insert
+			if (answersToSave.length > 0) {
+				const values = answersToSave.map(() => '(?, ?, ?, ?, ?, ?, ?)').join(',');
+				const params = answersToSave.flatMap(a => [
+					sessionId, a.playerId, a.questionId, a.choiceId, a.timeMs, a.isCorrect ? 1 : 0, a.score
+				]);
+				
+				await pool.execute(
+					`INSERT INTO player_answers (session_id, player_id, question_id, choice_id, time_ms, is_correct, score_earned) VALUES ${values}`,
+					params
+				);
+			}
+
+			// Clear cache sau khi save
+			state.answers = [];
+			state.lastUpdate = Date.now();
+			
+		} catch (error) {
+			console.error('Error batch saving answers:', error);
 		}
 	}
 };
@@ -338,11 +430,14 @@ io.on('connection', (socket) => {
 		}
 	});
 
-	// Next question (host only)
+	// Next question (host only) - Tối ưu với batch save
 	socket.on('next_question', async ({ sessionId }) => {
 		try {
 			const session = gameSessions.get(sessionId);
 			if (!session || session.host !== socket.id) return;
+			
+			// Tối ưu: Batch save answers trước khi chuyển câu hỏi
+			await GameUtils.batchSaveAnswers(sessionId);
 			
 			const [[row]] = await pool.execute(
 				'SELECT quiz_id FROM quiz_sessions WHERE id = ?', 
@@ -371,7 +466,7 @@ io.on('connection', (socket) => {
 		}
 	});
 
-	// Submit answer
+	// Submit answer - TỐI ƯU: Emit ngay lập tức, ghi DB async
 	socket.on('submit_answer', async (data) => {
 		if (!checkRateLimit('submit_answer', 500)) return; // 2 answers per second max
 		
@@ -380,6 +475,14 @@ io.on('connection', (socket) => {
 			const session = gameSessions.get(sessionId);
 			
 			if (session && socket.playerId) {
+				// Tối ưu: Emit ngay lập tức để player thấy phản hồi
+				io.to(sessionId).emit('player_answered', {
+					playerId: socket.playerId,
+					questionId,
+					choiceId,
+					timeMs
+				});
+				
 				// Record that this player has answered
 				if (!session.answerSet) session.answerSet = new Set();
 				session.answerSet.add(socket.playerId);
@@ -390,13 +493,8 @@ io.on('connection', (socket) => {
 					player.lastActivity = Date.now();
 				}
 				
-				// Notify other players about the answer
-				socket.to(sessionId).emit('player_answered', {
-					playerId: socket.playerId,
-					questionId,
-					choiceId,
-					timeMs
-				});
+				// Tối ưu: Lưu vào cache thay vì DB ngay
+				GameUtils.saveAnswerToCache(sessionId, socket.playerId, questionId, choiceId, timeMs);
 				
 				// Auto close if all current players answered and not closed yet
 				if (!session.questionClosed && session.players && session.answerSet.size >= session.players.size) {
@@ -426,11 +524,14 @@ io.on('connection', (socket) => {
 		}
 	});
 
-	// Close current question (host only)
+	// Close current question (host only) - Tối ưu với batch save
 	socket.on('close_question', async ({ sessionId }) => {
 		try {
 			const session = gameSessions.get(sessionId);
 			if (!session || session.host !== socket.id || session.questionClosed) return;
+			
+			// Tối ưu: Batch save answers khi đóng câu hỏi
+			await GameUtils.batchSaveAnswers(sessionId);
 			
 			session.questionClosed = true;
 			io.to(sessionId).emit('question_closed', { sessionId });
@@ -502,6 +603,7 @@ io.on('connection', (socket) => {
 				// Clean up empty sessions
 				if (session.players.size === 0 && !session.host) {
 					gameSessions.delete(sessionId);
+					gameStateCache.delete(sessionId); // Clean up cache
 				}
 			}
 		} catch (error) {
@@ -543,6 +645,7 @@ io.on('connection', (socket) => {
 			// Clean up empty sessions
 			if (session.players.size === 0 && !session.host) {
 				gameSessions.delete(sessionId);
+				gameStateCache.delete(sessionId); // Clean up cache
 			}
 			
 			console.log(`User disconnected: ${socket.id}`);
@@ -586,28 +689,41 @@ server.listen(PORT, () => {
 	console.log(`🔧 Environment: ${process.env.NODE_ENV || 'development'}`);
 	console.log(`⚡ Socket.io compression: enabled`);
 	console.log(`🔄 Cleanup interval: 5 minutes`);
+	console.log(`🚀 Realtime optimization: enabled (cache + async DB)`);
 });
 
 // Graceful shutdown
 const gracefulShutdown = (signal) => {
 	console.log(`${signal} received, shutting down gracefully`);
-	server.close(() => {
-		console.log('HTTP server closed');
-		
-		// Close database connections
-		pool.end((err) => {
-			if (err) {
-				console.error('Error closing database pool:', err);
-			} else {
-				console.log('Database connections closed');
-			}
+	
+	// Tối ưu: Batch save tất cả answers còn lại trước khi shutdown
+	const savePromises = [];
+	for (const [sessionId] of gameStateCache) {
+		savePromises.push(GameUtils.batchSaveAnswers(sessionId));
+	}
+	
+	Promise.all(savePromises).then(() => {
+		server.close(() => {
+			console.log('HTTP server closed');
 			
-			// Close socket.io
-			io.close(() => {
-				console.log('Socket.io server closed');
-				process.exit(0);
+			// Close database connections
+			pool.end((err) => {
+				if (err) {
+					console.error('Error closing database pool:', err);
+				} else {
+					console.log('Database connections closed');
+				}
+				
+				// Close socket.io
+				io.close(() => {
+					console.log('Socket.io server closed');
+					process.exit(0);
+				});
 			});
 		});
+	}).catch(err => {
+		console.error('Error saving final answers:', err);
+		process.exit(1);
 	});
 	
 	// Force exit after 10 seconds
