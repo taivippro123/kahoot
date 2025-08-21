@@ -411,18 +411,29 @@ io.on('connection', (socket) => {
 			);
 			if (!row) return;
 			
-			// Initialize session state
+			// Initialize session state - Đảm bảo bắt đầu từ câu hỏi đầu tiên
 			session.currentOrder = 1;
 			session.answerSet = new Set();
 			session.questionClosed = false;
 			session.status = 'in_progress';
+			
+			// Reset cache state khi bắt đầu game mới
+			if (gameStateCache.has(sessionId)) {
+				gameStateCache.delete(sessionId);
+			}
+			
+			console.log(`Game started for session ${sessionId}, starting with question ${session.currentOrder}`);
 
 			// Notify clients to navigate first
 			io.to(sessionId).emit('game_started', { sessionId });
 			
 			// Emit question after short delay to ensure listeners are ready
 			setTimeout(async () => {
-				await GameUtils.emitQuestion(io, sessionId, row.quiz_id, session.currentOrder, true);
+				console.log(`Emitting first question ${session.currentOrder} for session ${sessionId}`);
+				const success = await GameUtils.emitQuestion(io, sessionId, row.quiz_id, session.currentOrder, true);
+				if (!success) {
+					console.error(`Failed to emit first question for session ${sessionId}`);
+				}
 			}, 250);
 		} catch (error) {
 			console.error('Error in start_game:', error);
@@ -445,21 +456,47 @@ io.on('connection', (socket) => {
 			);
 			if (!row) return;
 			
-			// Move to next question
-			session.currentOrder = (session.currentOrder || 1) + 1;
-			session.answerSet = new Set();
-			session.questionClosed = false;
+			// Kiểm tra và tăng currentOrder một cách an toàn
+			const currentOrder = session.currentOrder || 0;
+			const nextOrder = currentOrder + 1;
 			
-			const ok = await GameUtils.emitQuestion(io, sessionId, row.quiz_id, session.currentOrder, true);
-			if (!ok) {
-				// No more questions: end game
+			// Kiểm tra xem câu hỏi tiếp theo có tồn tại không
+			const [[questionExists]] = await pool.execute(
+				'SELECT COUNT(*) as cnt FROM questions WHERE quiz_id = ? AND order_index = ?',
+				[row.quiz_id, nextOrder]
+			);
+			
+			if (questionExists.cnt === 0) {
+				// Không còn câu hỏi nào: kết thúc game
 				io.to(sessionId).emit('game_ended', { sessionId });
 				await pool.execute(
 					'UPDATE quiz_sessions SET status = "ended", ended_at = NOW() WHERE id = ?', 
 					[sessionId]
 				);
 				session.status = 'ended';
+				return;
 			}
+			
+			// Cập nhật session state
+			session.currentOrder = nextOrder;
+			session.answerSet = new Set();
+			session.questionClosed = false;
+			
+			// Debug logging
+			console.log(`Session ${sessionId} state updated:`, {
+				currentOrder: session.currentOrder,
+				answerSetSize: session.answerSet.size,
+				questionClosed: session.questionClosed
+			});
+			
+			// Emit câu hỏi mới
+			const ok = await GameUtils.emitQuestion(io, sessionId, row.quiz_id, session.currentOrder, true);
+			if (!ok) {
+				console.error('Failed to emit question for order:', session.currentOrder);
+				socket.emit('app_error', { message: 'Lỗi khi hiển thị câu hỏi' });
+			}
+			
+			console.log(`Moved to question ${session.currentOrder} for session ${sessionId}`);
 		} catch (error) {
 			console.error('Error in next_question:', error);
 			socket.emit('app_error', { message: 'Lỗi khi chuyển câu hỏi' });
@@ -474,8 +511,29 @@ io.on('connection', (socket) => {
 			const { sessionId, questionId, choiceId, timeMs } = data;
 			const session = gameSessions.get(sessionId);
 			
-			if (session && socket.playerId) {
-				// Tối ưu: Emit ngay lập tức để player thấy phản hồi
+					if (session && socket.playerId) {
+			// Debug logging
+			console.log(`Player ${socket.playerId} submitting answer for question ${questionId} in session ${sessionId}, currentOrder: ${session.currentOrder}`);
+			
+			// Validation: Kiểm tra xem questionId có khớp với currentOrder không
+			if (session.currentOrder && session.currentOrder > 0) {
+				const [[row]] = await pool.execute(
+					'SELECT quiz_id FROM quiz_sessions WHERE id = ?', 
+					[sessionId]
+				);
+				if (row) {
+					const [[questionRow]] = await pool.execute(
+						'SELECT id, order_index FROM questions WHERE quiz_id = ? AND order_index = ?',
+						[row.quiz_id, session.currentOrder]
+					);
+					
+					if (questionRow && questionRow.id !== questionId) {
+						console.warn(`Question ID mismatch: expected ${questionRow.id} for order ${session.currentOrder}, got ${questionId}`);
+					}
+				}
+			}
+			
+			// Tối ưu: Emit ngay lập tức để player thấy phản hồi
 				io.to(sessionId).emit('player_answered', {
 					playerId: socket.playerId,
 					questionId,
@@ -496,10 +554,19 @@ io.on('connection', (socket) => {
 				// Tối ưu: Lưu vào cache thay vì DB ngay
 				GameUtils.saveAnswerToCache(sessionId, socket.playerId, questionId, choiceId, timeMs);
 				
+				// Debug logging cho answerSet
+				console.log(`Session ${sessionId} answerSet updated:`, {
+					size: session.answerSet.size,
+					players: session.players.size,
+					questionClosed: session.questionClosed
+				});
+				
 				// Auto close if all current players answered and not closed yet
 				if (!session.questionClosed && session.players && session.answerSet.size >= session.players.size) {
 					session.questionClosed = true;
 					io.to(sessionId).emit('question_closed', { sessionId });
+					
+					console.log(`Auto-closing question for session ${sessionId}, all players answered`);
 					
 					// Send progress update
 					const [[row]] = await pool.execute(
